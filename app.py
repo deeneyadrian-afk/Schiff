@@ -353,3 +353,4 @@ async function usePower(kind,target,x,y){if(!state||state.phase!=="battle")retur
 async function shoot(target,x,y){if(locked)return;if(!state||state.phase!=="battle")return showOverlay("Spiel läuft noch nicht.");if(state.turn!==player)return showOverlay("Nicht dein Zug.");locked=true;const res=await post("/shoot",{room,player,target,x,y});if(res){state=res;clearPreview();lastRender="";renderAll();updateHeader();renderPowers()}locked=false}
 </script></body></html>
 """
+# v5.1
