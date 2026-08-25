@@ -192,12 +192,34 @@ def selfhit(r,pid):
     if dead(p): p["dead"]=True
     return {"x":x,"y":y,"ship":ship["name"],"emoji":ship["emoji"]}
 
+def _update_hit_streak(r, pid, is_hit):
+    """Robuste Treffer-Serie: nur echte Treffer zaehlen, echte Fehlschuesse resetten."""
+    player = r.get("players", {}).get(pid)
+    if not player:
+        return False
+    player.setdefault("streak", 0)
+    player.setdefault("powers", ep())
+    # Alte/gespeicherte Spielstaende koennen unvollstaendige Power-Dicts haben.
+    for key, value in ep().items():
+        player["powers"].setdefault(key, value)
+    if is_hit:
+        player["streak"] += 1
+        if player["streak"] >= 3:
+            player["streak"] = 0
+            grant(r, pid, "bomb")
+            return True
+    else:
+        player["streak"] = 0
+    return False
+
 def attack(r,sh,tg,x,y,streak=False):
     if x<0 or y<0 or x>=10 or y>=10: return {"kind":"out"}
+    if sh not in r.get("players", {}) or tg not in r.get("players", {}):
+        return {"kind":"invalid"}
     t=r["players"][tg]; b=t["board"]
     if b[y][x] in ["X","M"]: return {"kind":"old"}
     if mk(x,y) in t["mines"]:
-        t["mines"].remove(mk(x,y)); b[y][x]="M"; r["players"][sh]["streak"]=0
+        t["mines"].remove(mk(x,y)); b[y][x]="M"; _update_hit_streak(r,sh,False)
         mh=selfhit(r,sh)
         cells=[{"target":tg,"x":x,"y":y}]
         if mh:
@@ -224,11 +246,9 @@ def attack(r,sh,tg,x,y,streak=False):
         if perk_now:
             t["perk_unlocked"].add(sid)
             grant(r,tg,ship["bonus"])
-        # Jeder echte Treffer zaehlt fuer die 3-Treffer-Serie - egal ob normaler Schuss oder Power-up.
-        # Ein Fehlschuss setzt die Serie wieder auf 0 (siehe unten).
-        r["players"][sh]["streak"]+=1
-        if r["players"][sh]["streak"]>=3:
-            grant(r,sh,"bomb"); r["players"][sh]["streak"]=0
+        # Jeder echte Treffer zaehlt fuer die 3-Treffer-Serie - normaler Schuss und Power-ups gleich.
+        bomb_granted = _update_hit_streak(r,sh,True)
+        if bomb_granted:
             r["last"]={"type":"bomb_grant","by":sh,"cells":[{"target":tg,"x":x,"y":y}]}
         if sunk(b,sid) and sid not in t["sunk"]:
             t["sunk"].add(sid); ship=SHIPS[sid-1]
@@ -241,7 +261,7 @@ def attack(r,sh,tg,x,y,streak=False):
             r["last"]={"type":"hit","by":sh,"target":tg,"cells":[{"target":tg,"x":x,"y":y}]}
         return {"kind":"hit"}
     # Nur drei Treffer AM STUECK geben eine Bombe. Jeder echte Fehlschuss beendet die Serie.
-    r["players"][sh]["streak"]=0
+    _update_hit_streak(r,sh,False)
     b[y][x]="M"; r["last"]={"type":"miss","by":sh,"target":tg,"cells":[{"target":tg,"x":x,"y":y}]}
     return {"kind":"miss"}
 
@@ -552,4 +572,4 @@ async function shoot(target,x,y){if(locked)return;if(!state||state.phase!=="batt
 
 # v12 emergency stable single-file deploy
 
-# v17: perk after 2 hits + dead-board marking + bombardment perk + bomb after 3 consecutive hits
+# v18: robust consecutive-hit bomb logic + compatibility with old/restored rooms
