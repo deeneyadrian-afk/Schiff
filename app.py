@@ -192,34 +192,12 @@ def selfhit(r,pid):
     if dead(p): p["dead"]=True
     return {"x":x,"y":y,"ship":ship["name"],"emoji":ship["emoji"]}
 
-def _update_hit_streak(r, pid, is_hit):
-    """Robuste Treffer-Serie: nur echte Treffer zaehlen, echte Fehlschuesse resetten."""
-    player = r.get("players", {}).get(pid)
-    if not player:
-        return False
-    player.setdefault("streak", 0)
-    player.setdefault("powers", ep())
-    # Alte/gespeicherte Spielstaende koennen unvollstaendige Power-Dicts haben.
-    for key, value in ep().items():
-        player["powers"].setdefault(key, value)
-    if is_hit:
-        player["streak"] += 1
-        if player["streak"] >= 3:
-            player["streak"] = 0
-            grant(r, pid, "bomb")
-            return True
-    else:
-        player["streak"] = 0
-    return False
-
 def attack(r,sh,tg,x,y,streak=False):
     if x<0 or y<0 or x>=10 or y>=10: return {"kind":"out"}
-    if sh not in r.get("players", {}) or tg not in r.get("players", {}):
-        return {"kind":"invalid"}
     t=r["players"][tg]; b=t["board"]
     if b[y][x] in ["X","M"]: return {"kind":"old"}
     if mk(x,y) in t["mines"]:
-        t["mines"].remove(mk(x,y)); b[y][x]="M"; _update_hit_streak(r,sh,False)
+        t["mines"].remove(mk(x,y)); b[y][x]="M"; r["players"][sh]["streak"]=0
         mh=selfhit(r,sh)
         cells=[{"target":tg,"x":x,"y":y}]
         if mh:
@@ -246,22 +224,21 @@ def attack(r,sh,tg,x,y,streak=False):
         if perk_now:
             t["perk_unlocked"].add(sid)
             grant(r,tg,ship["bonus"])
-        # Jeder echte Treffer zaehlt fuer die 3-Treffer-Serie - normaler Schuss und Power-ups gleich.
-        bomb_granted = _update_hit_streak(r,sh,True)
-        if bomb_granted:
+        # Jeder echte Treffer zaehlt fuer die 3-Treffer-Bombe - egal ob normaler Schuss oder Power-up.
+        r["players"][sh]["streak"]+=1
+        if r["players"][sh]["streak"]>=3:
+            grant(r,sh,"bomb"); r["players"][sh]["streak"]-=3
             r["last"]={"type":"bomb_grant","by":sh,"cells":[{"target":tg,"x":x,"y":y}]}
         if sunk(b,sid) and sid not in t["sunk"]:
             t["sunk"].add(sid); ship=SHIPS[sid-1]
             r["last"]={"type":"sunk","by":sh,"target":tg,"ship":ship["name"],"emoji":ship["emoji"],"bonus":ship["bonus"],"perkUnlocked":perk_now,"cells":[{"target":tg,"x":x,"y":y}]}
             if dead(t): t["dead"]=True; setturn(r,sh)
-            winner(r); return {"kind":"sunk"}
+            winner(r); return {"kind":"sunk","perk":({"target":tg,"ship":ship["name"],"emoji":ship["emoji"],"bonus":ship["bonus"]} if perk_now else None)}
         if perk_now:
             r["last"]={"type":"perk_unlock","by":sh,"target":tg,"ship":ship["name"],"emoji":ship["emoji"],"bonus":ship["bonus"],"cells":[{"target":tg,"x":x,"y":y}]}
         elif not r["last"] or r["last"].get("type")!="bomb_grant":
             r["last"]={"type":"hit","by":sh,"target":tg,"cells":[{"target":tg,"x":x,"y":y}]}
-        return {"kind":"hit"}
-    # Nur drei Treffer AM STUECK geben eine Bombe. Jeder echte Fehlschuss beendet die Serie.
-    _update_hit_streak(r,sh,False)
+        return {"kind":"hit","perk":({"target":tg,"ship":ship["name"],"emoji":ship["emoji"],"bonus":ship["bonus"]} if perk_now else None)}
     b[y][x]="M"; r["last"]={"type":"miss","by":sh,"target":tg,"cells":[{"target":tg,"x":x,"y":y}]}
     return {"kind":"miss"}
 
@@ -398,21 +375,23 @@ def power():
     if kind in ["bomb","artillery","radar","sonar","bombardment"]:
         if target==p or target not in r["players"] or r["players"][target]["dead"]: return jsonify({"error":"Ziel ungültig."}),400
     if kind=="bomb":
-        me["powers"][kind]-=1; me["power_used_this_turn"]+=1; hits=0
+        me["powers"][kind]-=1; me["power_used_this_turn"]+=1; hits=0; perks=[]
         power_cells=[(x,y),(x+1,y),(x,y+1),(x+1,y+1)]
         for xx,yy in power_cells:
             res=attack(r,p,target,xx,yy,False)
             if res["kind"] in ["hit","sunk"]: hits+=1
-        r["last"]={"type":"power_shot","kind":"bomb","by":p,"target":target,"cells":[{"target":target,"x":xx,"y":yy} for xx,yy in power_cells if 0<=xx<10 and 0<=yy<10],"hits":hits}
+            if res.get("perk"): perks.append(res["perk"])
+        r["last"]={"type":"power_shot","kind":"bomb","by":p,"target":target,"cells":[{"target":target,"x":xx,"y":yy} for xx,yy in power_cells if 0<=xx<10 and 0<=yy<10],"hits":hits,"perks":perks}
         msg=f"Bombe: {hits} Treffer. Dein normaler Schuss bleibt erhalten."
     elif kind=="artillery":
         me["powers"][kind]-=1; me["power_used_this_turn"]+=1
         cells=[(x-1,y),(x,y),(x+1,y)] if h else [(x,y-1),(x,y),(x,y+1)]
-        hits=0
+        hits=0; perks=[]
         for xx,yy in cells:
             res=attack(r,p,target,xx,yy,False)
             if res["kind"] in ["hit","sunk"]: hits+=1
-        r["last"]={"type":"power_shot","kind":"artillery","by":p,"target":target,"cells":[{"target":target,"x":xx,"y":yy} for xx,yy in cells if 0<=xx<10 and 0<=yy<10],"hits":hits}
+            if res.get("perk"): perks.append(res["perk"])
+        r["last"]={"type":"power_shot","kind":"artillery","by":p,"target":target,"cells":[{"target":target,"x":xx,"y":yy} for xx,yy in cells if 0<=xx<10 and 0<=yy<10],"hits":hits,"perks":perks}
         msg=f"Artillerie: {hits} Treffer. Dein normaler Schuss bleibt erhalten."
     elif kind=="radar":
         me["powers"][kind]-=1; me["power_used_this_turn"]+=1
@@ -448,13 +427,14 @@ def power():
         b=r["players"][target]["board"]
         available=[(xx,yy) for yy in range(10) for xx in range(10) if b[yy][xx] not in ["X","M"]]
         chosen=random.sample(available,min(5,len(available)))
-        hits=0; fired=[]
+        hits=0; fired=[]; perks=[]
         for xx,yy in chosen:
             res=attack(r,p,target,xx,yy,False)
             fired.append({"target":target,"x":xx,"y":yy})
             if res["kind"] in ["hit","sunk"]: hits+=1
+            if res.get("perk"): perks.append(res["perk"])
             if r["phase"]=="done": break
-        r["last"]={"type":"power_shot","kind":"bombardment","by":p,"target":target,"cells":fired,"hits":hits}
+        r["last"]={"type":"power_shot","kind":"bombardment","by":p,"target":target,"cells":fired,"hits":hits,"perks":perks}
         msg=f"Bombardement: {len(fired)} Zufallsschüsse, {hits} Treffer."
     else:
         return jsonify({"error":"Unbekanntes Power-up."}),400
@@ -511,9 +491,9 @@ HTML = r"""
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,rgba(37,99,235,.24),transparent 32%),radial-gradient(circle at top right,rgba(16,185,129,.16),transparent 30%),#07111f;color:#eef4ff;font-family:Arial,sans-serif}h1{text-align:center;margin:16px 0 8px;font-size:32px}button,input{border:0;border-radius:12px;padding:9px 12px;margin:4px;font-weight:800}button{cursor:pointer;background:#f3f6fb;color:#07111f}button.active{background:#22c55e}button:disabled{opacity:.35}input{background:#eaf0f8}.hidden{display:none!important}.shell{display:grid;grid-template-columns:250px 1fr 260px;gap:14px;width:min(1620px,97vw);margin:0 auto 26px}.panel{padding:12px;background:rgba(16,29,49,.92);border:1px solid #2c4466;border-radius:18px;box-shadow:0 18px 60px rgba(0,0,0,.22)}.left,.side{position:sticky;top:10px;max-height:calc(100vh - 20px);overflow:auto}#lobby{width:min(680px,94vw);margin:20px auto;text-align:center}.status,.dock,.controls,.powerGrid{display:flex;justify-content:center;gap:7px;flex-wrap:wrap}.badge{padding:8px 11px;border-radius:999px;background:#17263d;border:1px solid #334b6c;font-weight:900;font-size:14px}.turnMe{background:#15803d}.turnOther{background:#7f1d1d}.ready{background:#1d4ed8}.dead{background:#374151;text-decoration:line-through;opacity:.65}.updateBox{width:min(760px,94vw);margin:8px auto 14px;padding:10px 14px;background:rgba(16,29,49,.92);border:1px solid #2c4466;border-radius:14px;font-size:12px;line-height:1.4;color:#dbeafe}.updateBox b{color:#fde68a}.updateBox .updateTitle{font-size:14px;color:#fff;margin-bottom:4px}#notice{min-height:32px;display:flex;justify-content:center;align-items:center;flex-wrap:wrap;gap:6px;margin-top:8px}.help p{font-size:12px;line-height:1.25;margin:7px 0;color:#dbeafe}.powerBtn{font-size:12px;padding:8px 9px}.powerNote{margin-top:9px;font-size:12px;color:#fde68a;line-height:1.3}.boardGrid{display:flex;justify-content:center;gap:16px;flex-wrap:wrap;margin:14px auto 28px}.card{background:rgba(16,29,49,.94);border:1px solid #2c4466;border-radius:18px;padding:11px;box-shadow:0 12px 35px rgba(0,0,0,.20)}.card h2{margin:4px 0 9px;font-size:19px;text-align:center}.card.activeTarget{outline:4px solid #22c55e;box-shadow:0 0 28px rgba(34,197,94,.45)}.card.activeTarget h2{color:#22c55e;text-shadow:0 0 12px rgba(34,197,94,.8)}.card.dangerOwn{outline:4px solid #facc15;box-shadow:0 0 28px rgba(250,204,21,.45)}.card.dangerOwn h2{color:#fde68a;text-shadow:0 0 12px rgba(250,204,21,.75)}.card.currentShooter h2{color:#f87171;text-shadow:0 0 12px rgba(239,68,68,.75)}.card.deadBoard{position:relative;filter:grayscale(1);opacity:.48;outline:3px solid #64748b}.card.deadBoard::after{content:attr(data-dead-label);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:1000;letter-spacing:2px;color:#f8fafc;background:rgba(15,23,42,.42);border-radius:18px;pointer-events:none;text-shadow:0 2px 8px #000;z-index:5}.turnName{font-weight:1000}.shotFlash{animation:shotFlash .75s ease-out 1}@keyframes shotFlash{0%{transform:scale(1);box-shadow:0 0 0 0 rgba(250,204,21,.95);outline:4px solid #facc15}45%{transform:scale(1.22);box-shadow:0 0 22px 8px rgba(250,204,21,.65);outline:4px solid #fde047}100%{transform:scale(1);box-shadow:none}}.board{display:grid;grid-template-columns:repeat(10,31px);gap:4px;background:#0d1728;border:1px solid #263d5c;padding:10px;border-radius:15px;min-width:382px;min-height:382px}.cell{width:31px;height:31px;border-radius:7px;background:#15507f;display:flex;align-items:center;justify-content:center;user-select:none;cursor:pointer;font-weight:900}.cell:hover{outline:2px solid white}.ship{background:#89939f}.hit{background:#b91c1c!important;color:#fff}.miss{background:#b8d9ef!important;color:#06243c}.reveal{background:#334155;color:#dbeafe}.mine{background:#7c2d12;color:white}.intel{background:#facc15!important;color:#111827}.preview{outline:3px solid #fbbf24!important;filter:brightness(1.35)}.dragShip{display:inline-flex;align-items:center;gap:4px;padding:8px;border-radius:14px;background:#17263d;border:1px solid #314767;cursor:pointer}.dragShip.selected{outline:3px solid #22c55e}.dragShip.placed{opacity:.35;text-decoration:line-through}.dragPart{width:22px;height:22px;background:#d0d7e2;border-radius:5px}#chatLog{height:300px;overflow:auto;text-align:left;background:#0b1526;border:1px solid #263d5c;border-radius:14px;padding:9px;font-size:13px}.chatLine{margin-bottom:6px;line-height:1.25}.chatForm{display:flex;gap:5px;margin-top:8px}#chatInput{flex:1;min-width:0;text-transform:none;margin:0}#overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:50;align-items:center;justify-content:center;pointer-events:none}#overlayBox{background:#f8fafc;color:#07111f;padding:24px 36px;border-radius:24px;font-size:26px;font-weight:1000;max-width:86vw;text-align:center}@media(max-width:1200px){.shell{grid-template-columns:1fr}.left,.side{position:relative;max-height:none}#chatLog{height:190px}.board{grid-template-columns:repeat(10,28px);min-width:352px;min-height:352px}.cell{width:28px;height:28px}}
 </style></head><body>
 <div id="overlay"><div id="overlayBox"></div></div><h1>🚢 Schiffe Versenken Multiplayer</h1>
-<div class="updateBox"><div class="updateTitle">🛠️ Letzte Updates</div><div>• Perk bereits nach <b>2 Treffern auf dasselbe Schiff</b></div><div>• <b>3 Treffer in Folge</b> geben eine Bombe – auch Treffer durch Power-ups</div><div>• Neues 2er-Schiff-Perk: <b>💣 Bombardement</b> – 5 zufällige Schüsse</div><div>• Ausgeschiedene Spieler werden auf dem Spielfeld deutlich markiert <span style="opacity:.55">(Gottwold ist ein Hund)</span></div></div><div id="lobby" class="panel"><input id="nameInput" placeholder="Dein Name" style="text-transform:none"><br><button onclick="createRoom()">Raum erstellen</button><input id="roomInput" placeholder="ROOM CODE"><button onclick="joinRoom()">Joinen</button></div>
+<div class="updateBox"><div class="updateTitle">🛠️ Letzte Updates</div><div>• Perk bereits nach <b>2 Treffern auf dasselbe Schiff</b></div><div>• <b>Jeder 3. Treffer</b> gibt eine Bombe – auch Treffer durch Power-ups</div><div>• Neues 2er-Schiff-Perk: <b>💣 Bombardement</b> – 5 zufällige Schüsse</div><div>• Ausgeschiedene Spieler werden auf dem Spielfeld deutlich markiert</div></div><div id="lobby" class="panel"><input id="nameInput" placeholder="Dein Name" style="text-transform:none"><br><button onclick="createRoom()">Raum erstellen</button><input id="roomInput" placeholder="ROOM CODE"><button onclick="joinRoom()">Joinen</button></div>
 <div id="game" class="hidden shell">
-<div class="left panel"><h3>Power-ups</h3><div class="powerGrid" id="powerBox"></div><div class="powerNote" id="powerCounter">Power-ups genutzt: 0/2</div><hr style="border-color:#2c4466"><div class="help"><p><b>🔥 3 Treffer in Folge</b> geben dir eine Bombe. Fehlschuss = Serie zurück auf 0.</p><p><b>💥 Bombe:</b> 2x2 auf Gegner.</p><p><b>📡 Radar:</b> 3x3 Scan.</p><p><b>🎯 Artillerie:</b> 3 Felder Linie, R dreht.</p><p><b>🔎 Sonar:</b> Reihe/Spalte, R dreht.</p><p><b>🧨 Mine:</b> aktiviere Mine, dann eigenes Wasserfeld klicken.</p><p><b>💣 Bombardement:</b> Wähle einen Gegner; 5 noch unbeschossene Felder werden zufällig bombardiert.</p><hr style="border-color:#2c4466"><p><b>Perk-Regel:</b> Ein Schiffs-Perk wird bereits nach dem 2. Treffer auf dieses Schiff freigeschaltet.</p><p><b>Neue Regel:</b> Power-ups kannst du jederzeit benutzen, auch wenn jemand anderes dran ist.</p><p><b>Limit:</b> Maximal 2 Power-ups bis zu deinem nächsten normalen Zug.</p><p><b>Wichtig:</b> Bombe/Artillerie verbrauchen deinen normalen Schuss nicht.</p></div></div>
+<div class="left panel"><h3>Power-ups</h3><div class="powerGrid" id="powerBox"></div><div class="powerNote" id="powerCounter">Power-ups genutzt: 0/2</div><hr style="border-color:#2c4466"><div class="help"><p><b>🔥 3 Treffer</b> geben dir eine Bombe.</p><p><b>💥 Bombe:</b> 2x2 auf Gegner.</p><p><b>📡 Radar:</b> 3x3 Scan.</p><p><b>🎯 Artillerie:</b> 3 Felder Linie, R dreht.</p><p><b>🔎 Sonar:</b> Reihe/Spalte, R dreht.</p><p><b>🧨 Mine:</b> aktiviere Mine, dann eigenes Wasserfeld klicken.</p><p><b>💣 Bombardement:</b> Wähle einen Gegner; 5 noch unbeschossene Felder werden zufällig bombardiert.</p><hr style="border-color:#2c4466"><p><b>Perk-Regel:</b> Ein Schiffs-Perk wird bereits nach dem 2. Treffer auf dieses Schiff freigeschaltet.</p><p><b>Neue Regel:</b> Power-ups kannst du jederzeit benutzen, auch wenn jemand anderes dran ist.</p><p><b>Limit:</b> Maximal 2 Power-ups bis zu deinem nächsten normalen Zug.</p><p><b>Wichtig:</b> Bombe/Artillerie verbrauchen deinen normalen Schuss nicht.</p></div></div>
 <div class="main"><div class="panel"><div class="status"><div class="badge">Raum: <b id="roomShow"></b></div><div class="badge">Du: <b id="playerShow"></b></div><div class="badge" id="phaseBadge">Lobby</div><div class="badge" id="turnBadge">-</div></div><div id="notice"></div><div id="placement"><p style="text-align:center">Schiff anklicken, dann aufs eigene Brett klicken. <b>R</b> dreht.</p><p style="text-align:center">Ausrichtung: <b id="dir">horizontal ➡️</b></p><div class="dock" id="shipDock"></div><div class="controls"><button onclick="randomPlacement()">Zufällig platzieren</button><button onclick="resetPlacement()">Reset</button><button onclick="readyUp()">Bereit</button><button id="startBtn" onclick="startGame()" class="hidden">Spiel starten</button><button id="restartBtn" onclick="restartGame()" class="hidden">Neue Runde</button></div></div></div><div id="boards" class="boardGrid"></div></div>
 <div class="side"><div class="panel"><h3 style="margin:0 0 8px;text-align:center">Chat</h3><div id="chatLog"></div><div class="chatForm"><input id="chatInput" placeholder="Nachricht"><button onclick="sendChat()">OK</button></div></div></div>
 </div>
@@ -526,7 +506,7 @@ async function post(url,data){const r=await fetch(url,{method:"POST",headers:{"C
 async function createRoom(){const j=await post("/create",{name:myName()});if(!j)return;room=j.room;player=j.player;startUi()}
 async function joinRoom(){const c=document.getElementById("roomInput").value.trim().toUpperCase();if(!c)return showOverlay("Code eingeben.");const j=await post("/join",{room:c,name:myName()});if(!j)return;room=j.room;player=j.player;startUi()}
 function startUi(){document.getElementById("lobby").classList.add("hidden");document.getElementById("game").classList.remove("hidden");document.getElementById("roomShow").textContent=room;document.getElementById("playerShow").textContent=player;renderDock();renderPowers();renderAll();loadState();setInterval(loadState,1200)}
-async function loadState(){if(!room||!player)return;const r=await fetch(`/state?room=${room}&player=${player}`);let j=null;try{j=await r.json()}catch(e){return}if(!r.ok){const key="schiffe_backup_"+room+"_"+player;const old=localStorage.getItem(key);if(old&&confirm("Verbindung/Raum verloren. Lokales Backup laden?")){try{const b=JSON.parse(old);const res=await post("/restore",b);if(res){state=res;lastRender="";renderAll();updateHeader();updateChat();renderPowers();showOverlay("Backup geladen.")}}catch(e){}}else{showOverlay(j.error||"Raum/Spieler nicht gefunden.")}return}state=j;locked=false;storeLocalBackup();document.getElementById("playerShow").textContent=playerName(player);updateHeader();updateChat();renderPowers();const ev=JSON.stringify(state.last);if(state.last&&ev!==lastEvent){lastEvent=ev;if(state.last.type==="sunk")showOverlay(`💥 Schiff gesprengt:<br>${state.last.emoji} ${state.last.ship}`);if(state.last.type==="perk_unlock"&&state.last.target===player)showOverlay(`⚡ Perk freigeschaltet:<br>${state.last.emoji} ${state.last.ship}<br>${powerLabels[state.last.bonus]||state.last.bonus}`);if(state.last.type==="mine_trigger")showOverlay(`🧨 Mine!<br>${playerName(state.last.by)} trifft sich selbst.`);if(state.last.type==="mine_win")showOverlay(`🧨 Mine!<br>${playerName(state.last.triggeredBy)} trifft sich selbst.<br>🏆 ${playerName(state.last.by)} gewinnt.`);if(state.last.type==="win")showOverlay(state.last.by===player?"🏆 Du hast gewonnen.":`🏆 ${playerName(state.last.by)} gewinnt.`);if(state.last.type==="intel"&&state.last.by===player)showOverlay("Markierung gesetzt.");if(state.last.type==="bomb_grant")showOverlay(`💥 ${playerName(state.last.by)} bekommt eine Bombe.`)}const key=JSON.stringify({phase:state.phase,turn:state.turn,boards:state.boards,players:state.players,winner:state.winner,powers:state.powers,powerUsed:state.powerUsed});if(key!==lastRender){lastRender=key;renderAll();setTimeout(()=>animateLastShot(),30)}else{setTimeout(()=>animateLastShot(),30)}}
+async function loadState(){if(!room||!player)return;const r=await fetch(`/state?room=${room}&player=${player}`);let j=null;try{j=await r.json()}catch(e){return}if(!r.ok){const key="schiffe_backup_"+room+"_"+player;const old=localStorage.getItem(key);if(old&&confirm("Verbindung/Raum verloren. Lokales Backup laden?")){try{const b=JSON.parse(old);const res=await post("/restore",b);if(res){state=res;lastRender="";renderAll();updateHeader();updateChat();renderPowers();showOverlay("Backup geladen.")}}catch(e){}}else{showOverlay(j.error||"Raum/Spieler nicht gefunden.")}return}state=j;locked=false;storeLocalBackup();document.getElementById("playerShow").textContent=playerName(player);updateHeader();updateChat();renderPowers();const ev=JSON.stringify(state.last);if(state.last&&ev!==lastEvent){lastEvent=ev;if(state.last.type==="sunk"){let txt=`💥 Schiff gesprengt:<br>${state.last.emoji} ${state.last.ship}`;if(state.last.perkUnlocked)txt+=`<br>⚡ ${playerName(state.last.target)} bekommt: ${powerLabels[state.last.bonus]||state.last.bonus}`;showOverlay(txt)}if(state.last.type==="perk_unlock")showOverlay(`⚡ ${playerName(state.last.target)} bekommt ein Perk:<br>${state.last.emoji} ${state.last.ship}<br>${powerLabels[state.last.bonus]||state.last.bonus}`);if(state.last.type==="power_shot"&&state.last.perks&&state.last.perks.length){const ps=state.last.perks.map(q=>`${playerName(q.target)} bekommt ${powerLabels[q.bonus]||q.bonus}`).join("<br>");showOverlay(`⚡ Perk freigeschaltet:<br>${ps}`)};if(state.last.type==="mine_trigger")showOverlay(`🧨 Mine!<br>${playerName(state.last.by)} trifft sich selbst.`);if(state.last.type==="mine_win")showOverlay(`🧨 Mine!<br>${playerName(state.last.triggeredBy)} trifft sich selbst.<br>🏆 ${playerName(state.last.by)} gewinnt.`);if(state.last.type==="win")showOverlay(state.last.by===player?"🏆 Du hast gewonnen.":`🏆 ${playerName(state.last.by)} gewinnt.`);if(state.last.type==="intel"&&state.last.by===player)showOverlay("Markierung gesetzt.");if(state.last.type==="bomb_grant")showOverlay(`💥 ${playerName(state.last.by)} bekommt eine Bombe.`)}const key=JSON.stringify({phase:state.phase,turn:state.turn,boards:state.boards,players:state.players,winner:state.winner,powers:state.powers,powerUsed:state.powerUsed});if(key!==lastRender){lastRender=key;renderAll();setTimeout(()=>animateLastShot(),30)}else{setTimeout(()=>animateLastShot(),30)}}
 function updateHeader(){document.getElementById("phaseBadge").textContent=state.phase==="lobby"?"Lobby":state.phase==="battle"?"Battle":"Ende";const t=document.getElementById("turnBadge");if(state.phase==="battle"){t.textContent=state.turn===player?"DU BIST DRAN":`${playerName(state.turn)} ist dran`;t.className="badge "+(state.turn===player?"turnMe":"turnOther")}else{t.textContent="-";t.className="badge"}document.getElementById("notice").innerHTML=state.players.map(p=>`<span class="badge ${p.dead?"dead":p.ready?"ready":""}">${escapeHtml(p.name)}: ${p.ready?"bereit":"nicht bereit"}${p.dead?" / raus":""}</span>`).join("");const allReady=state.players.length>=2&&state.players.every(p=>p.ready);document.getElementById("startBtn").classList.toggle("hidden",!(player==="p1"&&state.phase==="lobby"&&allReady));document.getElementById("restartBtn").classList.toggle("hidden",!(player==="p1"&&state.phase==="done"));document.getElementById("placement").classList.toggle("hidden",state.phase!=="lobby")}
 function renderPowers(){const box=document.getElementById("powerBox");if(!box)return;box.innerHTML="";const powers=state?.powers||{bomb:0,radar:0,artillery:0,sonar:0,mine:0,bombardment:0};const used=state?.powerUsed||0,limit=state?.powerLimit||2;const counter=document.getElementById("powerCounter");if(counter)counter.textContent=`Power-ups genutzt: ${used}/${limit}`;Object.keys(powerLabels).forEach(k=>{const b=document.createElement("button");b.className="powerBtn"+(activePower===k?" active":"");b.textContent=`${powerLabels[k]} (${powers[k]||0})`;b.disabled=(powers[k]||0)<=0||state?.phase!=="battle"||used>=limit;b.onclick=()=>{activePower=activePower===k?null:k;clearPreview();renderPowers()};box.appendChild(b)})}
 function updateChat(){const log=document.getElementById("chatLog");const html=state.chat.map(m=>`<div class="chatLine"><b>${escapeHtml(m.from)}:</b> ${escapeHtml(m.text)}</div>`).join("");if(log.innerHTML!==html){log.innerHTML=html;log.scrollTop=log.scrollHeight}}
@@ -572,4 +552,5 @@ async function shoot(target,x,y){if(locked)return;if(!state||state.phase!=="batt
 
 # v12 emergency stable single-file deploy
 
-# v18: robust consecutive-hit bomb logic + compatibility with old/restored rooms
+# v13: perk after 2 hits + dead-board marking + bombardment perk
+# v16: perk unlock popups are visible to all players, including unlocks caused by multi-cell power-ups
