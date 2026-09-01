@@ -36,6 +36,8 @@ JSON_FALLBACK_PATH = os.environ.get("ROOM_STORE_PATH", "rooms_state.json")
 
 def _rehydrate_room(data):
     for _, room in data.items():
+        room.setdefault("event_seq", 0)
+        room.setdefault("notices", [])
         for _, p in room.get("players", {}).items():
             p["sunk"] = set(p.get("sunk", []))
             p["mines"] = set(p.get("mines", []))
@@ -152,6 +154,12 @@ def adv(r):
     new=cur(r)
     if new in r["players"]: r["players"][new]["power_used_this_turn"]=0
 def grant(r,p,pow): r["players"][p]["powers"][pow]+=1
+def push_notice(r, kind, **payload):
+    r["event_seq"] = int(r.get("event_seq", 0)) + 1
+    notice = {"id": r["event_seq"], "type": kind, **payload}
+    r.setdefault("notices", []).append(notice)
+    r["notices"] = r["notices"][-30:]
+    return notice
 def intel(r,v,t,x,y): r["players"][v]["intel"].setdefault(t,set()).add(mk(x,y))
 
 def view(r,v,t):
@@ -187,8 +195,16 @@ def selfhit(r,pid):
     x,y,sid=random.choice(fs)
     p["board"][y][x]="X"
     ship=SHIPS[sid-1]
+    sid_key=str(sid)
+    p.setdefault("ship_hits", {str(i):0 for i in range(1,6)})
+    p.setdefault("perk_unlocked", set())
+    p["ship_hits"][sid_key]=p["ship_hits"].get(sid_key,0)+1
+    if p["ship_hits"][sid_key]>=2 and sid not in p["perk_unlocked"]:
+        p["perk_unlocked"].add(sid)
+        grant(r,pid,ship["bonus"])
+        push_notice(r,"perk_unlock",target=pid,ship=ship["name"],emoji=ship["emoji"],bonus=ship["bonus"])
     if sunk(p["board"],sid) and sid not in p["sunk"]:
-        p["sunk"].add(sid); grant(r,pid,ship["bonus"])
+        p["sunk"].add(sid)
     if dead(p): p["dead"]=True
     return {"x":x,"y":y,"ship":ship["name"],"emoji":ship["emoji"]}
 
@@ -224,10 +240,11 @@ def attack(r,sh,tg,x,y,streak=False):
         if perk_now:
             t["perk_unlocked"].add(sid)
             grant(r,tg,ship["bonus"])
-        # Jeder echte Treffer zaehlt fuer die 3-Treffer-Bombe - egal ob normaler Schuss oder Power-up.
+            push_notice(r,"perk_unlock",target=tg,ship=ship["name"],emoji=ship["emoji"],bonus=ship["bonus"])
+        # Bombe nur fuer 3 Treffer AM STUECK. Treffer durch Power-ups zaehlen mit.
         r["players"][sh]["streak"]+=1
         if r["players"][sh]["streak"]>=3:
-            grant(r,sh,"bomb"); r["players"][sh]["streak"]-=3
+            grant(r,sh,"bomb"); r["players"][sh]["streak"]=0
             r["last"]={"type":"bomb_grant","by":sh,"cells":[{"target":tg,"x":x,"y":y}]}
         if sunk(b,sid) and sid not in t["sunk"]:
             t["sunk"].add(sid); ship=SHIPS[sid-1]
@@ -239,7 +256,7 @@ def attack(r,sh,tg,x,y,streak=False):
         elif not r["last"] or r["last"].get("type")!="bomb_grant":
             r["last"]={"type":"hit","by":sh,"target":tg,"cells":[{"target":tg,"x":x,"y":y}]}
         return {"kind":"hit","perk":({"target":tg,"ship":ship["name"],"emoji":ship["emoji"],"bonus":ship["bonus"]} if perk_now else None)}
-    b[y][x]="M"; r["last"]={"type":"miss","by":sh,"target":tg,"cells":[{"target":tg,"x":x,"y":y}]}
+    b[y][x]="M"; r["players"][sh]["streak"]=0; r["last"]={"type":"miss","by":sh,"target":tg,"cells":[{"target":tg,"x":x,"y":y}]}
     return {"kind":"miss"}
 
 def state(c,v):
@@ -252,6 +269,7 @@ def state(c,v):
     return {"room":c,"you":v,"phase":r["phase"],"players":players,"boards":boards,
             "turn":cur(r) if r["phase"]=="battle" else None,"winner":r["winner"],"last":r["last"],
             "chat":r["chat"][-80:],"powers":r["players"][v]["powers"],
+            "notices":r.get("notices",[])[-30:],
             "powerUsed":r["players"][v].get("power_used_this_turn",0),"powerLimit":2}
 
 
@@ -276,7 +294,7 @@ def home(): return Response(HTML,mimetype="text/html")
 def create():
     c=rc(); name=clean(request.json.get("name"),"Player 1")
     rooms[c]={"players":{"p1":np(name)},"order":["p1"],"phase":"lobby","turn_index":0,
-              "winner":None,"last":None,"chat":[{"from":"System","text":f"{name} hat den Raum erstellt."}]}
+              "winner":None,"last":None,"event_seq":0,"notices":[],"chat":[{"from":"System","text":f"{name} hat den Raum erstellt."}]}
     return jsonify({"room":c,"player":"p1"})
 
 @app.route("/join",methods=["POST"])
@@ -493,12 +511,12 @@ HTML = r"""
 <div id="overlay"><div id="overlayBox"></div></div><h1>🚢 Schiffe Versenken Multiplayer</h1>
 <div class="updateBox"><div class="updateTitle">🛠️ Letzte Updates</div><div>• Perk bereits nach <b>2 Treffern auf dasselbe Schiff</b></div><div>• <b>Jeder 3. Treffer</b> gibt eine Bombe – auch Treffer durch Power-ups</div><div>• Neues 2er-Schiff-Perk: <b>💣 Bombardement</b> – 5 zufällige Schüsse</div><div>• Ausgeschiedene Spieler werden auf dem Spielfeld deutlich markiert</div></div><div id="lobby" class="panel"><input id="nameInput" placeholder="Dein Name" style="text-transform:none"><br><button onclick="createRoom()">Raum erstellen</button><input id="roomInput" placeholder="ROOM CODE"><button onclick="joinRoom()">Joinen</button></div>
 <div id="game" class="hidden shell">
-<div class="left panel"><h3>Power-ups</h3><div class="powerGrid" id="powerBox"></div><div class="powerNote" id="powerCounter">Power-ups genutzt: 0/2</div><hr style="border-color:#2c4466"><div class="help"><p><b>🔥 3 Treffer</b> geben dir eine Bombe.</p><p><b>💥 Bombe:</b> 2x2 auf Gegner.</p><p><b>📡 Radar:</b> 3x3 Scan.</p><p><b>🎯 Artillerie:</b> 3 Felder Linie, R dreht.</p><p><b>🔎 Sonar:</b> Reihe/Spalte, R dreht.</p><p><b>🧨 Mine:</b> aktiviere Mine, dann eigenes Wasserfeld klicken.</p><p><b>💣 Bombardement:</b> Wähle einen Gegner; 5 noch unbeschossene Felder werden zufällig bombardiert.</p><hr style="border-color:#2c4466"><p><b>Perk-Regel:</b> Ein Schiffs-Perk wird bereits nach dem 2. Treffer auf dieses Schiff freigeschaltet.</p><p><b>Neue Regel:</b> Power-ups kannst du jederzeit benutzen, auch wenn jemand anderes dran ist.</p><p><b>Limit:</b> Maximal 2 Power-ups bis zu deinem nächsten normalen Zug.</p><p><b>Wichtig:</b> Bombe/Artillerie verbrauchen deinen normalen Schuss nicht.</p></div></div>
+<div class="left panel"><h3>Power-ups</h3><div class="powerGrid" id="powerBox"></div><div class="powerNote" id="powerCounter">Power-ups genutzt: 0/2</div><hr style="border-color:#2c4466"><div class="help"><p><b>🔥 3 Treffer am Stück</b> geben dir eine Bombe. Power-up-Treffer zählen mit; ein Fehlschuss setzt die Serie zurück.</p><p><b>💥 Bombe:</b> 2x2 auf Gegner.</p><p><b>📡 Radar:</b> 3x3 Scan.</p><p><b>🎯 Artillerie:</b> 3 Felder Linie, R dreht.</p><p><b>🔎 Sonar:</b> Reihe/Spalte, R dreht.</p><p><b>🧨 Mine:</b> aktiviere Mine, dann eigenes Wasserfeld klicken.</p><p><b>💣 Bombardement:</b> Wähle einen Gegner; 5 noch unbeschossene Felder werden zufällig bombardiert.</p><hr style="border-color:#2c4466"><p><b>Perk-Regel:</b> Ein Schiffs-Perk wird bereits nach dem 2. Treffer auf dieses Schiff freigeschaltet.</p><p><b>Neue Regel:</b> Power-ups kannst du jederzeit benutzen, auch wenn jemand anderes dran ist.</p><p><b>Limit:</b> Maximal 2 Power-ups bis zu deinem nächsten normalen Zug.</p><p><b>Wichtig:</b> Bombe/Artillerie verbrauchen deinen normalen Schuss nicht.</p></div></div>
 <div class="main"><div class="panel"><div class="status"><div class="badge">Raum: <b id="roomShow"></b></div><div class="badge">Du: <b id="playerShow"></b></div><div class="badge" id="phaseBadge">Lobby</div><div class="badge" id="turnBadge">-</div></div><div id="notice"></div><div id="placement"><p style="text-align:center">Schiff anklicken, dann aufs eigene Brett klicken. <b>R</b> dreht.</p><p style="text-align:center">Ausrichtung: <b id="dir">horizontal ➡️</b></p><div class="dock" id="shipDock"></div><div class="controls"><button onclick="randomPlacement()">Zufällig platzieren</button><button onclick="resetPlacement()">Reset</button><button onclick="readyUp()">Bereit</button><button id="startBtn" onclick="startGame()" class="hidden">Spiel starten</button><button id="restartBtn" onclick="restartGame()" class="hidden">Neue Runde</button></div></div></div><div id="boards" class="boardGrid"></div></div>
 <div class="side"><div class="panel"><h3 style="margin:0 0 8px;text-align:center">Chat</h3><div id="chatLog"></div><div class="chatForm"><input id="chatInput" placeholder="Nachricht"><button onclick="sendChat()">OK</button></div></div></div>
 </div>
 <script>
-let room=null,player=null,state=null,horizontal=true,selectedShip=null,placements=[],localBoard=Array.from({length:10},()=>Array(10).fill(0)),locked=false,lastEvent="",lastRender="",activePower=null;
+let room=null,player=null,state=null,horizontal=true,selectedShip=null,placements=[],localBoard=Array.from({length:10},()=>Array(10).fill(0)),locked=false,lastEvent="",lastRender="",activePower=null,lastNoticeId=0,overlayQueue=[],overlayBusy=false;
 const ships=[{id:1,name:"Radarträger",len:5,emoji:"📡"},{id:2,name:"Artillerieschiff",len:4,emoji:"🎯"},{id:3,name:"Minenkreuzer",len:3,emoji:"🧨"},{id:4,name:"Sonar-U-Boot",len:3,emoji:"🔎"},{id:5,name:"Bombardement-Zerstörer",len:2,emoji:"💣"}];
 const powerLabels={bomb:"💥 Bombe",radar:"📡 Radar",artillery:"🎯 Arty",sonar:"🔎 Sonar",mine:"🧨 Mine",bombardment:"💣 Bombardement"};
 function myName(){return document.getElementById("nameInput").value.trim()||"No Name Admiral"}function playerName(pid){return state?.players?.find(p=>p.id===pid)?.name||pid}
@@ -506,7 +524,7 @@ async function post(url,data){const r=await fetch(url,{method:"POST",headers:{"C
 async function createRoom(){const j=await post("/create",{name:myName()});if(!j)return;room=j.room;player=j.player;startUi()}
 async function joinRoom(){const c=document.getElementById("roomInput").value.trim().toUpperCase();if(!c)return showOverlay("Code eingeben.");const j=await post("/join",{room:c,name:myName()});if(!j)return;room=j.room;player=j.player;startUi()}
 function startUi(){document.getElementById("lobby").classList.add("hidden");document.getElementById("game").classList.remove("hidden");document.getElementById("roomShow").textContent=room;document.getElementById("playerShow").textContent=player;renderDock();renderPowers();renderAll();loadState();setInterval(loadState,1200)}
-async function loadState(){if(!room||!player)return;const r=await fetch(`/state?room=${room}&player=${player}`);let j=null;try{j=await r.json()}catch(e){return}if(!r.ok){const key="schiffe_backup_"+room+"_"+player;const old=localStorage.getItem(key);if(old&&confirm("Verbindung/Raum verloren. Lokales Backup laden?")){try{const b=JSON.parse(old);const res=await post("/restore",b);if(res){state=res;lastRender="";renderAll();updateHeader();updateChat();renderPowers();showOverlay("Backup geladen.")}}catch(e){}}else{showOverlay(j.error||"Raum/Spieler nicht gefunden.")}return}state=j;locked=false;storeLocalBackup();document.getElementById("playerShow").textContent=playerName(player);updateHeader();updateChat();renderPowers();const ev=JSON.stringify(state.last);if(state.last&&ev!==lastEvent){lastEvent=ev;if(state.last.type==="sunk"){let txt=`💥 Schiff gesprengt:<br>${state.last.emoji} ${state.last.ship}`;if(state.last.perkUnlocked)txt+=`<br>⚡ ${playerName(state.last.target)} bekommt: ${powerLabels[state.last.bonus]||state.last.bonus}`;showOverlay(txt)}if(state.last.type==="perk_unlock")showOverlay(`⚡ ${playerName(state.last.target)} bekommt ein Perk:<br>${state.last.emoji} ${state.last.ship}<br>${powerLabels[state.last.bonus]||state.last.bonus}`);if(state.last.type==="power_shot"&&state.last.perks&&state.last.perks.length){const ps=state.last.perks.map(q=>`${playerName(q.target)} bekommt ${powerLabels[q.bonus]||q.bonus}`).join("<br>");showOverlay(`⚡ Perk freigeschaltet:<br>${ps}`)};if(state.last.type==="mine_trigger")showOverlay(`🧨 Mine!<br>${playerName(state.last.by)} trifft sich selbst.`);if(state.last.type==="mine_win")showOverlay(`🧨 Mine!<br>${playerName(state.last.triggeredBy)} trifft sich selbst.<br>🏆 ${playerName(state.last.by)} gewinnt.`);if(state.last.type==="win")showOverlay(state.last.by===player?"🏆 Du hast gewonnen.":`🏆 ${playerName(state.last.by)} gewinnt.`);if(state.last.type==="intel"&&state.last.by===player)showOverlay("Markierung gesetzt.");if(state.last.type==="bomb_grant")showOverlay(`💥 ${playerName(state.last.by)} bekommt eine Bombe.`)}const key=JSON.stringify({phase:state.phase,turn:state.turn,boards:state.boards,players:state.players,winner:state.winner,powers:state.powers,powerUsed:state.powerUsed});if(key!==lastRender){lastRender=key;renderAll();setTimeout(()=>animateLastShot(),30)}else{setTimeout(()=>animateLastShot(),30)}}
+async function loadState(){if(!room||!player)return;const r=await fetch(`/state?room=${room}&player=${player}`);let j=null;try{j=await r.json()}catch(e){return}if(!r.ok){const key="schiffe_backup_"+room+"_"+player;const old=localStorage.getItem(key);if(old&&confirm("Verbindung/Raum verloren. Lokales Backup laden?")){try{const b=JSON.parse(old);const res=await post("/restore",b);if(res){state=res;lastRender="";renderAll();updateHeader();updateChat();renderPowers();showOverlay("Backup geladen.")}}catch(e){}}else{showOverlay(j.error||"Raum/Spieler nicht gefunden.")}return}state=j;locked=false;storeLocalBackup();document.getElementById("playerShow").textContent=playerName(player);updateHeader();updateChat();renderPowers();processNotices();const ev=JSON.stringify(state.last);if(state.last&&ev!==lastEvent){lastEvent=ev;if(state.last.type==="sunk")showOverlay(`💥 Schiff gesprengt:<br>${state.last.emoji} ${state.last.ship}`);if(state.last.type==="mine_trigger")showOverlay(`🧨 Mine!<br>${playerName(state.last.by)} trifft sich selbst.`);if(state.last.type==="mine_win")showOverlay(`🧨 Mine!<br>${playerName(state.last.triggeredBy)} trifft sich selbst.<br>🏆 ${playerName(state.last.by)} gewinnt.`);if(state.last.type==="win")showOverlay(state.last.by===player?"🏆 Du hast gewonnen.":`🏆 ${playerName(state.last.by)} gewinnt.`);if(state.last.type==="intel"&&state.last.by===player)showOverlay("Markierung gesetzt.");if(state.last.type==="bomb_grant")showOverlay(`💥 ${playerName(state.last.by)} bekommt eine Bombe.`)}const key=JSON.stringify({phase:state.phase,turn:state.turn,boards:state.boards,players:state.players,winner:state.winner,powers:state.powers,powerUsed:state.powerUsed});if(key!==lastRender){lastRender=key;renderAll();setTimeout(()=>animateLastShot(),30)}else{setTimeout(()=>animateLastShot(),30)}}
 function updateHeader(){document.getElementById("phaseBadge").textContent=state.phase==="lobby"?"Lobby":state.phase==="battle"?"Battle":"Ende";const t=document.getElementById("turnBadge");if(state.phase==="battle"){t.textContent=state.turn===player?"DU BIST DRAN":`${playerName(state.turn)} ist dran`;t.className="badge "+(state.turn===player?"turnMe":"turnOther")}else{t.textContent="-";t.className="badge"}document.getElementById("notice").innerHTML=state.players.map(p=>`<span class="badge ${p.dead?"dead":p.ready?"ready":""}">${escapeHtml(p.name)}: ${p.ready?"bereit":"nicht bereit"}${p.dead?" / raus":""}</span>`).join("");const allReady=state.players.length>=2&&state.players.every(p=>p.ready);document.getElementById("startBtn").classList.toggle("hidden",!(player==="p1"&&state.phase==="lobby"&&allReady));document.getElementById("restartBtn").classList.toggle("hidden",!(player==="p1"&&state.phase==="done"));document.getElementById("placement").classList.toggle("hidden",state.phase!=="lobby")}
 function renderPowers(){const box=document.getElementById("powerBox");if(!box)return;box.innerHTML="";const powers=state?.powers||{bomb:0,radar:0,artillery:0,sonar:0,mine:0,bombardment:0};const used=state?.powerUsed||0,limit=state?.powerLimit||2;const counter=document.getElementById("powerCounter");if(counter)counter.textContent=`Power-ups genutzt: ${used}/${limit}`;Object.keys(powerLabels).forEach(k=>{const b=document.createElement("button");b.className="powerBtn"+(activePower===k?" active":"");b.textContent=`${powerLabels[k]} (${powers[k]||0})`;b.disabled=(powers[k]||0)<=0||state?.phase!=="battle"||used>=limit;b.onclick=()=>{activePower=activePower===k?null:k;clearPreview();renderPowers()};box.appendChild(b)})}
 function updateChat(){const log=document.getElementById("chatLog");const html=state.chat.map(m=>`<div class="chatLine"><b>${escapeHtml(m.from)}:</b> ${escapeHtml(m.text)}</div>`).join("");if(log.innerHTML!==html){log.innerHTML=html;log.scrollTop=log.scrollHeight}}
@@ -515,7 +533,11 @@ function storeLocalBackup(){if(!room||!player||!state)return;try{fetch(`/backup?
 async function backupRoom(){if(!room||!player)return showOverlay("Kein Raum aktiv.");const r=await fetch(`/backup?room=${room}&player=${player}`);const j=await r.json();if(!r.ok)return showOverlay(j.error||"Backup Fehler");const txt=JSON.stringify(j);try{await navigator.clipboard.writeText(txt);showOverlay("Backup kopiert.")}catch(e){prompt("Backup kopieren:",txt)}}
 async function restoreRoom(){const txt=prompt("Backup hier einfügen:");if(!txt)return;try{const b=JSON.parse(txt);const res=await post("/restore",b);if(res){room=b.room;player=b.player;state=res;document.getElementById("lobby").classList.add("hidden");document.getElementById("game").classList.remove("hidden");document.getElementById("roomShow").textContent=room;lastRender="";renderAll();updateHeader();updateChat();renderPowers();showOverlay("Backup geladen.")}}catch(e){showOverlay("Backup ungültig.")}}
 async function sendChat(){const inp=document.getElementById("chatInput"),text=inp.value.trim();if(!text)return;inp.value="";const res=await post("/chat",{room,player,text});if(res){state=res;updateChat()}}
-document.getElementById("chatInput").addEventListener("keydown",e=>{if(e.key==="Enter")sendChat()});function showOverlay(text){const o=document.getElementById("overlay"),b=document.getElementById("overlayBox");b.innerHTML=text;o.style.display="flex";setTimeout(()=>o.style.display="none",1900)}document.addEventListener("keydown",e=>{if(e.key.toLowerCase()==="r")rotate()});function rotate(){horizontal=!horizontal;document.getElementById("dir").textContent=horizontal?"horizontal ➡️":"vertikal ⬇️";clearPreview()}
+document.getElementById("chatInput").addEventListener("keydown",e=>{if(e.key==="Enter")sendChat()});
+function processNotices(){if(!state||!Array.isArray(state.notices))return;const fresh=state.notices.filter(n=>Number(n.id)>lastNoticeId).sort((a,b)=>a.id-b.id);fresh.forEach(n=>{lastNoticeId=Math.max(lastNoticeId,Number(n.id)||0);if(n.type==="perk_unlock")showOverlay(`⚡ ${playerName(n.target)} bekommt ein Perk:<br>${n.emoji} ${n.ship}<br>${powerLabels[n.bonus]||n.bonus}`)});}
+function showOverlay(text){overlayQueue.push(text);if(overlayBusy)return;showNextOverlay()}
+function showNextOverlay(){if(!overlayQueue.length){overlayBusy=false;return}overlayBusy=true;const text=overlayQueue.shift(),o=document.getElementById("overlay"),b=document.getElementById("overlayBox");b.innerHTML=text;o.style.display="flex";setTimeout(()=>{o.style.display="none";setTimeout(showNextOverlay,120)},1900)}
+document.addEventListener("keydown",e=>{if(e.key.toLowerCase()==="r")rotate()});function rotate(){horizontal=!horizontal;document.getElementById("dir").textContent=horizontal?"horizontal ➡️":"vertikal ⬇️";clearPreview()}
 function renderDock(){const dock=document.getElementById("shipDock");dock.innerHTML="";ships.forEach(s=>{const placed=placements.some(p=>p.id===s.id);const box=document.createElement("div");box.className="dragShip"+(placed?" placed":"")+(selectedShip===s.id?" selected":"");box.onclick=()=>{if(!placed){selectedShip=s.id;renderDock()}};box.innerHTML=`<b>${s.emoji} ${s.name} (${s.len})</b>`;for(let i=0;i<s.len;i++){const part=document.createElement("div");part.className="dragPart";box.appendChild(part)}dock.appendChild(box)})}
 function canPlaceLocal(x,y,len,dir=horizontal){const cells=[];for(let i=0;i<len;i++){const xx=dir?x+i:x,yy=dir?y:y+i;if(xx<0||yy<0||xx>=10||yy>=10||localBoard[yy][xx]!==0)return null;cells.push([xx,yy])}return cells}
 function placeSelected(x,y){if(!selectedShip)return showOverlay("Erst ein Schiff auswählen.");const ship=ships.find(s=>s.id===selectedShip),cells=canPlaceLocal(x,y,ship.len);if(!cells)return showOverlay("Passt da nicht hin.");cells.forEach(([xx,yy])=>localBoard[yy][xx]=ship.id);placements.push({id:ship.id,x,y,horizontal});selectedShip=null;renderDock();renderAll()}
@@ -523,7 +545,7 @@ function resetPlacement(){placements=[];selectedShip=null;localBoard=Array.from(
 function randomPlacement(){resetPlacement();ships.forEach(ship=>{let done=false;for(let tries=0;tries<1000&&!done;tries++){const dir=Math.random()>.5,x=Math.floor(Math.random()*10),y=Math.floor(Math.random()*10),cells=canPlaceLocal(x,y,ship.len,dir);if(cells){cells.forEach(([xx,yy])=>localBoard[yy][xx]=ship.id);placements.push({id:ship.id,x,y,horizontal:dir});done=true}}});selectedShip=null;renderDock();renderAll()}
 async function readyUp(){if(placements.length<5)return showOverlay(`Erst alle Schiffe platzieren. ${placements.length}/5`);const res=await post("/ready",{room,player,placements});if(res){state=res;renderAll();updateHeader();updateChat();renderPowers()}}
 async function startGame(){const res=await post("/start",{room,player});if(res){state=res;renderAll();updateHeader();updateChat();renderPowers()}}
-async function restartGame(){const res=await post("/restart",{room,player});if(res){state=res;placements=[];selectedShip=null;activePower=null;localBoard=Array.from({length:10},()=>Array(10).fill(0));lastEvent="";lastRender="";renderDock();renderAll();updateHeader();updateChat();renderPowers()}}
+async function restartGame(){const res=await post("/restart",{room,player});if(res){state=res;placements=[];selectedShip=null;activePower=null;localBoard=Array.from({length:10},()=>Array(10).fill(0));lastEvent="";lastRender="";lastNoticeId=Math.max(0,...((state.notices||[]).map(n=>Number(n.id)||0)));renderDock();renderAll();updateHeader();updateChat();renderPowers()}}
 function clearPreview(){document.querySelectorAll(".cell.preview").forEach(el=>el.classList.remove("preview"))}
 function applyPreview(target,x,y,enemy){clearPreview();if(!activePower)return;let cells=[];if(activePower==="bomb")cells=[[x,y],[x+1,y],[x,y+1],[x+1,y+1]];else if(activePower==="artillery")cells=horizontal?[[x-1,y],[x,y],[x+1,y]]:[[x,y-1],[x,y],[x,y+1]];else if(activePower==="radar"){for(let yy=y-1;yy<=y+1;yy++)for(let xx=x-1;xx<=x+1;xx++)cells.push([xx,yy])}else if(activePower==="sonar"){if(horizontal){for(let xx=0;xx<10;xx++)cells.push([xx,y])}else{for(let yy=0;yy<10;yy++)cells.push([x,yy])}}else if(activePower==="mine"&&!enemy)cells=[[x,y]];else if(activePower==="bombardment")cells=[];cells.forEach(([xx,yy])=>{if(xx<0||yy<0||xx>=10||yy>=10)return;const el=document.querySelector(`[data-target="${target}"][data-x="${xx}"][data-y="${yy}"]`);if(el)el.classList.add("preview")})}
 function animateLastShot(){
@@ -554,3 +576,5 @@ async function shoot(target,x,y){if(locked)return;if(!state||state.phase!=="batt
 
 # v13: perk after 2 hits + dead-board marking + bombardment perk
 # v16: perk unlock popups are visible to all players, including unlocks caused by multi-cell power-ups
+
+# v17: bomb requires 3 consecutive hits (power hits count) + durable global perk notifications
